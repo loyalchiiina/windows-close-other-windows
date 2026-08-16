@@ -1,0 +1,37 @@
+# EXPERIENCE-LOG — windows-close-other-windows 技能经验台账
+
+> 本台账**持续追加**：每次对该技能做修改/排障/跨机器部署后，按下方模板在顶部加一条（日期 + 版本 + 结论/坑）。
+> 规则：①结论要可复现（路径、命令、schema 写全）；②踩过的坑标注「坑」；③与本文件已有结论冲突时，新条目为准并标注「修正」。
+
+---
+
+## 2026-08-15 · 技能创建 + GUI 模式首次排障 + 实机测试通过
+
+**背景**：用户需求「一键清理 Windows 任务栏」实为**一键关闭任务栏上所有打开的软件窗口、保留当前正在使用的窗口**（前台窗口 GetForegroundWindow）。交付物 = SKILL.md + 核心脚本 + 桌面快捷方式「一键关闭其他窗口」。
+
+**关键结论（可复用）**：
+
+1. **命名/登记**：系统/工具域前缀 `windows-*`，分项直名 `windows-close-other-windows`；已登记 `E:\codex\skills\SKILL-INDEX.md` 系统/工具行，路由注明「关闭任务栏其他窗口→`windows-close-other-windows`」；description 用全角冒号「触发词：…」且无 ASCII 冒号。
+2. **任务栏窗口枚举判定**（与任务管理器/Alt-Tab 一致的顶层窗口集合）：
+   - `EnumWindows` + `IsWindowVisible` + 非空标题
+   - 排除窗口类：`Progman`/`WorkerW`（桌面）、`Shell_TrayWnd`/`Shell_SecondaryTrayWnd`（任务栏）、`Windows.UI.Core.CoreWindow`（开始菜单/操作中心）、`DV2ControlHost`（通知区溢出）、`Shell_InputPanel` 等
+   - 任务栏可见判定：`WS_EX_APPWINDOW` 置位，**或**（无所有者窗口 `GW_OWNER` 且非 `WS_EX_TOOLWINDOW`）
+   - 保留规则：前台窗口（`GetForegroundWindow` 抓取时机 = 脚本启动瞬间）+ 脚本自身进程 + `-KeepTitle`/`-KeepPid` 指定项
+3. **关闭方式**：`PostMessage(WM_CLOSE)` 优雅关闭 → 等 4 秒 → `IsWindow` 复查 → 未关闭的**如实报告**；强杀仅限 `-ForceRemaining`（agent 已获用户同意）或 GUI 二次确认，且**永远跳过保护进程** `$ProtectedProcess`（explorer/dwm/csrss/svchost/conhost 等）。
+4. **两种运行模式**：无参数 = GUI 勾选（桌面快捷方式用，`-WindowStyle Hidden` 运行）；agent 用 `-List`（纯扫描）/ `-Close -NoConfirm`（执行，可加 `-KeepTitle`/`-KeepPid`/`-ForceRemaining`）。
+
+**坑清单（本次实打实踩过的）**：
+
+- **坑1（最重，GUI 模式崩溃无提示）**：**PowerShell 变量名不区分大小写**——GUI 部分用了 `$list` 作为 CheckedListBox 变量，与参数 `[switch]$List` 冲突。执行 `$list = New-Object ...` 实际是在给 SwitchParameter 类型的 `$List` 赋值 → `Cannot convert value "System.Windows.Forms.CheckedListBox" to type "SwitchParameter"` → GUI 模式直接崩。而 `-List`/`-Close` 分支因为提前 `exit` 永远走不到 GUI 代码，**干跑验证全绿但双击快捷方式毫无反应**（`-WindowStyle Hidden` 吞掉了所有错误输出）。修复：GUI 变量全部改名 `$chkList`。教训：**switch 参数命名不要与脚本内任何变量重名（含大小写变体）**；GUI 模式必须单独实测，不能只靠 -List 干跑。
+- **坑2（编码）**：`write` 工具产出 UTF-8 **无 BOM**，PowerShell 5.1 按 ANSI 读取 → 中文全部乱码 → 整文件解析失败（报错全是乱码 token）。修复：写完后用 `[System.IO.File]::WriteAllText($p, $content, (New-Object System.Text.UTF8Encoding $true))` 补 BOM。**注意 `edit` 工具每次写回会丢掉 BOM**——所以任何 edit 之后必须重新补一次 BOM。验证：`[System.IO.File]::ReadAllBytes($p)[0..2]` 应为 `EF BB BF`。
+- **坑3（$pid 只读）**：`$PID` 是 PowerShell 只读自动变量（当前进程 ID），脚本里 `$pid = 0` 赋值直接抛 `Cannot overwrite variable PID because it is read-only`，导致 `GetWindowThreadProcessId` 全部失败、所有窗口被错误归属到当前进程。修复：局部变量改名 `$procId`。
+- **坑4（前台窗口抓取时机）**：前台窗口必须在脚本**启动瞬间**抓取（GUI 弹出前），否则对话框/控制台本身会变成前台窗口，导致"当前窗口"判定错误。
+- **坑5（验证无副作用技巧）**：测 `-Close` 分支又不真关任何窗口 → 传 `-KeepTitle "*"` 使待关闭数恒为 0（`Test-ShouldClose` 里 `-like "*$t*"` 全匹配），输出「待关闭 0 个窗口」即证明 Close 逻辑链路无语法/运行时错误。
+
+**实机测试结果（2026-08-15，用户桌面）**：
+- `-List` 干跑：正确列出 21~23 个任务栏窗口（微信/QQ/Edge/360 浏览器/文件资源管理器/任务管理器等），当前 DeepSeek Harness 窗口正确标记 `[当前窗口-保留]`。
+- GUI 模式：修复坑1后弹窗正常，列出全部窗口、当前窗口默认不勾选，用户双击实测「测试成功」。
+- `-Close -NoConfirm -KeepTitle "*"` 零目标回归：通过。
+- 桌面快捷方式：`powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File <脚本路径>`，图标 `shell32.dll,22`，已存在于 `C:\Users\Administrator\Desktop\一键关闭其他窗口.lnk`。
+
+**部署提示（跨机器）**：技能目录整体复制到目标机 `E:\codex\skills\windows-close-other-windows\` 即可；桌面快捷方式需按「创建/修复桌面快捷方式」小节重建；脚本要求 PowerShell 5.1+（`#Requires -Version 5.1`），中文内容必须保持 UTF-8 BOM。
